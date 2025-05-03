@@ -1,0 +1,560 @@
+// File: Scripts/CarAgentController.cs
+
+using UnityEngine;
+using UnityEngine.AI;
+using System.Collections.Generic;
+
+public class CarAgentController : MonoBehaviour
+{
+    [Header("Navigation Settings")]
+    public Transform destination;
+    public float detectionRadius = 10f;
+    public float viewAngle = 60f;
+    public float slowDownDistance = 3f;
+    public LayerMask pedestrianLayer;
+    public float normalSpeed = 5f;
+    public float stopSpeed = 0f;
+    public float slowSpeed = 1.5f;
+    public float avoidOffset = 2f;
+    public float pedestrianStillThreshold = 0.1f;
+    public float avoidCurveForwardOffset = 3f;
+    public float rotationSmoothSpeed = 5f;
+    public float stillTimeThreshold = 1f;
+
+    [Header("Prediction Settings")]
+    public float pedestrianSpeed = 1.5f;
+    public float predictionTime = 1.0f;
+    public float checkInterval = 0.2f;
+    public int maxHistory = 5;
+
+    [Header("Wheel Settings")]
+    public Transform frontLeftWheel;
+    public Transform frontRightWheel;
+    public Transform rearLeftWheel;
+    public Transform rearRightWheel;
+    public Transform frontLeftWheelMesh;
+    public Transform frontRightWheelMesh;
+    public Transform rearLeftWheelMesh;
+    public Transform rearRightWheelMesh;
+    public float wheelSpinSpeed = 300f;
+    public float maxSteerAngle = 30f;
+
+    private NavMeshAgent agent;
+    private bool isAvoiding = false;
+    private Queue<Vector3> avoidPath = new Queue<Vector3>();
+
+    private Dictionary<Transform, PedestrianData> pedestrianStates = new();
+    private Dictionary<Transform, List<Vector3>> pedestrianHistories = new();
+
+    class PedestrianData
+    {
+        public Vector3 lastPosition;
+        public float timeObserved = 0f;
+        public float totalMovement = 0f;
+        public int age = 30;
+    }
+
+    void Start()
+    {
+        agent = GetComponent<NavMeshAgent>();
+        agent.speed = normalSpeed;
+        agent.SetDestination(destination.position);
+        agent.updateRotation = false;
+    }
+
+    void Update()
+    {
+        DetectAndPredictPedestrian();
+        HandleAvoiding();
+        UpdateWheels();
+
+        if (!agent.pathPending && agent.remainingDistance < 0.5f && !isAvoiding)
+        {
+            agent.speed = 0f;
+        }
+    }
+
+    void DetectAndPredictPedestrian()
+    {
+        bool shouldSlowDown = false;
+        Collider[] hits = GetPedestriansInCone();
+
+        foreach (var hit in hits)
+        {
+            Transform pedestrian = hit.transform;
+
+            if (!pedestrianStates.ContainsKey(pedestrian))
+                pedestrianStates[pedestrian] = new PedestrianData { lastPosition = pedestrian.position };
+
+            if (!pedestrianHistories.ContainsKey(pedestrian))
+                pedestrianHistories[pedestrian] = new List<Vector3>();
+
+            PedestrianData data = pedestrianStates[pedestrian];
+            float moved = Vector3.Distance(pedestrian.position, data.lastPosition);
+            data.totalMovement += moved;
+            data.lastPosition = pedestrian.position;
+            data.timeObserved += Time.deltaTime;
+
+            List<Vector3> history = pedestrianHistories[pedestrian];
+            if (history.Count >= maxHistory)
+                history.RemoveAt(0);
+            history.Add(pedestrian.position);
+
+            float dist = Vector3.Distance(transform.position, pedestrian.position);
+
+            float confidence = CalculateConfidence(history, data.age);
+            Vector3 predictedPos = PredictPosition(pedestrian, confidence);
+            float distToPredicted = Vector3.Distance(transform.position, predictedPos);
+
+            if (distToPredicted < slowDownDistance)
+            {
+                shouldSlowDown = true;
+                if (data.timeObserved >= stillTimeThreshold && data.totalMovement < pedestrianStillThreshold && !isAvoiding)
+                {
+                    BuildSmoothAvoidPath();
+                    return;
+                }
+            }
+        }
+
+        if (!isAvoiding)
+        {
+            agent.speed = shouldSlowDown ? slowSpeed : normalSpeed;
+        }
+
+        CleanUpPedestrians(hits);
+    }
+
+    float CalculateConfidence(List<Vector3> history, int age)
+    {
+        if (history.Count < 2) return 1f;
+
+        float totalDist = 0f;
+        for (int i = 1; i < history.Count; i++)
+        {
+            totalDist += Vector3.Distance(history[i], history[i - 1]);
+        }
+
+        float expectedDist = pedestrianSpeed * checkInterval * (history.Count - 1);
+        float movementRatio = totalDist / expectedDist;
+        float stability = Mathf.Clamp01(1f - Mathf.Abs(1f - movementRatio));
+
+        float ageFactor = (age <= 12 || age >= 65) ? 0.7f : 1f;
+
+        return stability * ageFactor;
+    }
+
+    Vector3 PredictPosition(Transform pedestrian, float confidence)
+    {
+        if (confidence <= 0.05f)
+            return pedestrian.position;
+
+        return pedestrian.position + (pedestrian.forward * pedestrianSpeed * confidence * predictionTime);
+    }
+
+    Collider[] GetPedestriansInCone()
+    {
+        Collider[] all = Physics.OverlapSphere(transform.position, detectionRadius, pedestrianLayer);
+        List<Collider> visible = new List<Collider>();
+
+        foreach (var col in all)
+        {
+            Vector3 dirToTarget = (col.transform.position - transform.position).normalized;
+            float angle = Vector3.Angle(transform.forward, dirToTarget);
+
+            if (angle <= viewAngle * 0.5f)
+                visible.Add(col);
+        }
+        return visible.ToArray();
+    }
+
+    void HandleAvoiding()
+    {
+        if (isAvoiding && !agent.pathPending && agent.remainingDistance < 0.5f)
+        {
+            if (avoidPath.Count > 0)
+            {
+                agent.SetDestination(avoidPath.Dequeue());
+                agent.speed = slowSpeed;
+            }
+            else
+            {
+                agent.SetDestination(destination.position);
+                agent.speed = normalSpeed;
+                isAvoiding = false;
+            }
+        }
+    }
+
+    void BuildSmoothAvoidPath()
+    {
+        isAvoiding = true;
+        avoidPath.Clear();
+
+        Vector3 side = -transform.right;
+        Vector3 forward = transform.forward;
+        Vector3 start = transform.position;
+
+        Vector3 p1 = start + forward * 1f;
+        Vector3 p2 = p1 + side * avoidOffset + forward * (avoidCurveForwardOffset * 0.5f);
+        Vector3 p3 = p2 + forward * avoidCurveForwardOffset;
+
+        Vector3[] curvePoints = GenerateBezierPoints(start, p1, p2, p3, 4);
+        foreach (var point in curvePoints)
+        {
+            if (NavMesh.SamplePosition(point, out NavMeshHit hit, 1f, NavMesh.AllAreas))
+                avoidPath.Enqueue(hit.position);
+        }
+
+        if (avoidPath.Count > 0)
+        {
+            agent.SetDestination(avoidPath.Dequeue());
+            agent.speed = slowSpeed;
+        }
+    }
+
+    Vector3[] GenerateBezierPoints(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, int segments)
+    {
+        Vector3[] points = new Vector3[segments];
+        for (int i = 0; i < segments; i++)
+        {
+            float t = (float)i / (segments - 1);
+            points[i] = Mathf.Pow(1 - t, 3) * p0 +
+                        3 * Mathf.Pow(1 - t, 2) * t * p1 +
+                        3 * (1 - t) * Mathf.Pow(t, 2) * p2 +
+                        Mathf.Pow(t, 3) * p3;
+        }
+        return points;
+    }
+
+    void CleanUpPedestrians(Collider[] currentHits)
+    {
+        var keys = new List<Transform>(pedestrianStates.Keys);
+        foreach (var key in keys)
+        {
+            bool found = false;
+            foreach (var hit in currentHits)
+                if (hit.transform == key)
+                    found = true;
+
+            if (!found)
+            {
+                pedestrianStates.Remove(key);
+                pedestrianHistories.Remove(key);
+            }
+        }
+    }
+
+    void UpdateWheels()
+    {
+        float speed = agent.velocity.magnitude;
+        float rotationAngle = speed * wheelSpinSpeed * Time.deltaTime;
+
+        if (frontLeftWheelMesh != null) frontLeftWheelMesh.Rotate(Vector3.right, rotationAngle);
+        if (frontRightWheelMesh != null) frontRightWheelMesh.Rotate(Vector3.right, rotationAngle);
+        if (rearLeftWheelMesh != null) rearLeftWheelMesh.Rotate(Vector3.right, rotationAngle);
+        if (rearRightWheelMesh != null) rearRightWheelMesh.Rotate(Vector3.right, rotationAngle);
+
+        if (frontLeftWheel != null && frontRightWheel != null && speed > 0.1f)
+        {
+            Vector3 localVelocity = transform.InverseTransformDirection(agent.velocity.normalized);
+            float steerInput = Mathf.Clamp(localVelocity.x, -1f, 1f);
+            float steerAngle = steerInput * maxSteerAngle;
+
+            frontLeftWheel.localRotation = Quaternion.Euler(0, steerAngle, 0);
+            frontRightWheel.localRotation = Quaternion.Euler(0, steerAngle, 0);
+        }
+    }
+
+    void OnDrawGizmosSelected()
+    {
+        Gizmos.color = Color.cyan;
+        Gizmos.DrawWireSphere(transform.position, detectionRadius);
+
+        Gizmos.color = Color.green;
+        Vector3 leftDir = Quaternion.Euler(0, -viewAngle * 0.5f, 0) * transform.forward;
+        Vector3 rightDir = Quaternion.Euler(0, viewAngle * 0.5f, 0) * transform.forward;
+        Gizmos.DrawLine(transform.position, transform.position + leftDir * detectionRadius);
+        Gizmos.DrawLine(transform.position, transform.position + rightDir * detectionRadius);
+    }
+}
+// File: Scripts/CarAgentController.cs
+
+using UnityEngine;
+using UnityEngine.AI;
+using System.Collections.Generic;
+
+public class CarAgentController : MonoBehaviour
+{
+    [Header("Navigation Settings")]
+    public Transform destination;
+    public float detectionRadius = 10f;
+    public float viewAngle = 60f;
+    public float slowDownDistance = 3f;
+    public LayerMask pedestrianLayer;
+    public float normalSpeed = 5f;
+    public float stopSpeed = 0f;
+    public float slowSpeed = 1.5f;
+    public float avoidOffset = 2f;
+    public float pedestrianStillThreshold = 0.1f;
+    public float avoidCurveForwardOffset = 3f;
+    public float rotationSmoothSpeed = 5f;
+    public float stillTimeThreshold = 1f;
+
+    [Header("Prediction Settings")]
+    public float pedestrianSpeed = 1.5f;
+    public float predictionTime = 1.0f;
+    public float checkInterval = 0.2f;
+    public int maxHistory = 5;
+
+    [Header("Wheel Settings")]
+    public Transform frontLeftWheel;
+    public Transform frontRightWheel;
+    public Transform rearLeftWheel;
+    public Transform rearRightWheel;
+    public Transform frontLeftWheelMesh;
+    public Transform frontRightWheelMesh;
+    public Transform rearLeftWheelMesh;
+    public Transform rearRightWheelMesh;
+    public float wheelSpinSpeed = 300f;
+    public float maxSteerAngle = 30f;
+
+    private NavMeshAgent agent;
+    private bool isAvoiding = false;
+    private Queue<Vector3> avoidPath = new Queue<Vector3>();
+
+    private Dictionary<Transform, PedestrianData> pedestrianStates = new();
+    private Dictionary<Transform, List<Vector3>> pedestrianHistories = new();
+
+    class PedestrianData
+    {
+        public Vector3 lastPosition;
+        public float timeObserved = 0f;
+        public float totalMovement = 0f;
+        public int age = 30;
+    }
+
+    void Start()
+    {
+        agent = GetComponent<NavMeshAgent>();
+        agent.speed = normalSpeed;
+        agent.SetDestination(destination.position);
+        agent.updateRotation = false;
+    }
+
+    void Update()
+    {
+        DetectAndPredictPedestrian();
+        HandleAvoiding();
+        UpdateWheels();
+
+        if (!agent.pathPending && agent.remainingDistance < 0.5f && !isAvoiding)
+        {
+            agent.speed = 0f;
+        }
+    }
+
+    void DetectAndPredictPedestrian()
+    {
+        bool shouldSlowDown = false;
+        Collider[] hits = GetPedestriansInCone();
+
+        foreach (var hit in hits)
+        {
+            Transform pedestrian = hit.transform;
+
+            if (!pedestrianStates.ContainsKey(pedestrian))
+                pedestrianStates[pedestrian] = new PedestrianData { lastPosition = pedestrian.position };
+
+            if (!pedestrianHistories.ContainsKey(pedestrian))
+                pedestrianHistories[pedestrian] = new List<Vector3>();
+
+            PedestrianData data = pedestrianStates[pedestrian];
+            float moved = Vector3.Distance(pedestrian.position, data.lastPosition);
+            data.totalMovement += moved;
+            data.lastPosition = pedestrian.position;
+            data.timeObserved += Time.deltaTime;
+
+            List<Vector3> history = pedestrianHistories[pedestrian];
+            if (history.Count >= maxHistory)
+                history.RemoveAt(0);
+            history.Add(pedestrian.position);
+
+            float dist = Vector3.Distance(transform.position, pedestrian.position);
+
+            float confidence = CalculateConfidence(history, data.age);
+            Vector3 predictedPos = PredictPosition(pedestrian, confidence);
+            float distToPredicted = Vector3.Distance(transform.position, predictedPos);
+
+            if (distToPredicted < slowDownDistance)
+            {
+                shouldSlowDown = true;
+                if (data.timeObserved >= stillTimeThreshold && data.totalMovement < pedestrianStillThreshold && !isAvoiding)
+                {
+                    BuildSmoothAvoidPath();
+                    return;
+                }
+            }
+        }
+
+        if (!isAvoiding)
+        {
+            agent.speed = shouldSlowDown ? slowSpeed : normalSpeed;
+        }
+
+        CleanUpPedestrians(hits);
+    }
+
+    float CalculateConfidence(List<Vector3> history, int age)
+    {
+        if (history.Count < 2) return 1f;
+
+        float totalDist = 0f;
+        for (int i = 1; i < history.Count; i++)
+        {
+            totalDist += Vector3.Distance(history[i], history[i - 1]);
+        }
+
+        float expectedDist = pedestrianSpeed * checkInterval * (history.Count - 1);
+        float movementRatio = totalDist / expectedDist;
+        float stability = Mathf.Clamp01(1f - Mathf.Abs(1f - movementRatio));
+
+        float ageFactor = (age <= 12 || age >= 65) ? 0.7f : 1f;
+
+        return stability * ageFactor;
+    }
+
+    Vector3 PredictPosition(Transform pedestrian, float confidence)
+    {
+        if (confidence <= 0.05f)
+            return pedestrian.position;
+
+        return pedestrian.position + (pedestrian.forward * pedestrianSpeed * confidence * predictionTime);
+    }
+
+    Collider[] GetPedestriansInCone()
+    {
+        Collider[] all = Physics.OverlapSphere(transform.position, detectionRadius, pedestrianLayer);
+        List<Collider> visible = new List<Collider>();
+
+        foreach (var col in all)
+        {
+            Vector3 dirToTarget = (col.transform.position - transform.position).normalized;
+            float angle = Vector3.Angle(transform.forward, dirToTarget);
+
+            if (angle <= viewAngle * 0.5f)
+                visible.Add(col);
+        }
+        return visible.ToArray();
+    }
+
+    void HandleAvoiding()
+    {
+        if (isAvoiding && !agent.pathPending && agent.remainingDistance < 0.5f)
+        {
+            if (avoidPath.Count > 0)
+            {
+                agent.SetDestination(avoidPath.Dequeue());
+                agent.speed = slowSpeed;
+            }
+            else
+            {
+                agent.SetDestination(destination.position);
+                agent.speed = normalSpeed;
+                isAvoiding = false;
+            }
+        }
+    }
+
+    void BuildSmoothAvoidPath()
+    {
+        isAvoiding = true;
+        avoidPath.Clear();
+
+        Vector3 side = -transform.right;
+        Vector3 forward = transform.forward;
+        Vector3 start = transform.position;
+
+        Vector3 p1 = start + forward * 1f;
+        Vector3 p2 = p1 + side * avoidOffset + forward * (avoidCurveForwardOffset * 0.5f);
+        Vector3 p3 = p2 + forward * avoidCurveForwardOffset;
+
+        Vector3[] curvePoints = GenerateBezierPoints(start, p1, p2, p3, 4);
+        foreach (var point in curvePoints)
+        {
+            if (NavMesh.SamplePosition(point, out NavMeshHit hit, 1f, NavMesh.AllAreas))
+                avoidPath.Enqueue(hit.position);
+        }
+
+        if (avoidPath.Count > 0)
+        {
+            agent.SetDestination(avoidPath.Dequeue());
+            agent.speed = slowSpeed;
+        }
+    }
+
+    Vector3[] GenerateBezierPoints(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, int segments)
+    {
+        Vector3[] points = new Vector3[segments];
+        for (int i = 0; i < segments; i++)
+        {
+            float t = (float)i / (segments - 1);
+            points[i] = Mathf.Pow(1 - t, 3) * p0 +
+                        3 * Mathf.Pow(1 - t, 2) * t * p1 +
+                        3 * (1 - t) * Mathf.Pow(t, 2) * p2 +
+                        Mathf.Pow(t, 3) * p3;
+        }
+        return points;
+    }
+
+    void CleanUpPedestrians(Collider[] currentHits)
+    {
+        var keys = new List<Transform>(pedestrianStates.Keys);
+        foreach (var key in keys)
+        {
+            bool found = false;
+            foreach (var hit in currentHits)
+                if (hit.transform == key)
+                    found = true;
+
+            if (!found)
+            {
+                pedestrianStates.Remove(key);
+                pedestrianHistories.Remove(key);
+            }
+        }
+    }
+
+    void UpdateWheels()
+    {
+        float speed = agent.velocity.magnitude;
+        float rotationAngle = speed * wheelSpinSpeed * Time.deltaTime;
+
+        if (frontLeftWheelMesh != null) frontLeftWheelMesh.Rotate(Vector3.right, rotationAngle);
+        if (frontRightWheelMesh != null) frontRightWheelMesh.Rotate(Vector3.right, rotationAngle);
+        if (rearLeftWheelMesh != null) rearLeftWheelMesh.Rotate(Vector3.right, rotationAngle);
+        if (rearRightWheelMesh != null) rearRightWheelMesh.Rotate(Vector3.right, rotationAngle);
+
+        if (frontLeftWheel != null && frontRightWheel != null && speed > 0.1f)
+        {
+            Vector3 localVelocity = transform.InverseTransformDirection(agent.velocity.normalized);
+            float steerInput = Mathf.Clamp(localVelocity.x, -1f, 1f);
+            float steerAngle = steerInput * maxSteerAngle;
+
+            frontLeftWheel.localRotation = Quaternion.Euler(0, steerAngle, 0);
+            frontRightWheel.localRotation = Quaternion.Euler(0, steerAngle, 0);
+        }
+    }
+
+    void OnDrawGizmosSelected()
+    {
+        Gizmos.color = Color.cyan;
+        Gizmos.DrawWireSphere(transform.position, detectionRadius);
+
+        Gizmos.color = Color.green;
+        Vector3 leftDir = Quaternion.Euler(0, -viewAngle * 0.5f, 0) * transform.forward;
+        Vector3 rightDir = Quaternion.Euler(0, viewAngle * 0.5f, 0) * transform.forward;
+        Gizmos.DrawLine(transform.position, transform.position + leftDir * detectionRadius);
+        Gizmos.DrawLine(transform.position, transform.position + rightDir * detectionRadius);
+    }
+}
